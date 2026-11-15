@@ -1,5 +1,32 @@
 const { useEffect, useLayoutEffect, useRef, useState } = React;
 
+const RESUME_FILENAME = 'Subin_Ratna_Tuladhar.pdf';
+const STATS_ENDPOINT = '/.netlify/functions/portfolio-stats';
+const RESUME_ENDPOINT = '/.netlify/functions/resume-download';
+
+function getVisitorId() {
+  const storageKey = 'portfolio-visitor-id';
+  let visitorId = window.localStorage.getItem(storageKey);
+
+  if (!visitorId) {
+    visitorId = window.crypto.randomUUID();
+    window.localStorage.setItem(storageKey, visitorId);
+  }
+
+  return visitorId;
+}
+
+async function fetchPortfolioStats(visitorId) {
+  const response = await fetch(`${STATS_ENDPOINT}?visitorId=${encodeURIComponent(visitorId)}`);
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.error || 'Could not load portfolio stats.');
+  }
+
+  return data;
+}
+
 const navItems = [
   { id: 'home', label: 'Home' },
   { id: 'about', label: 'About' },
@@ -226,7 +253,39 @@ function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [typedName, setTypedName] = useState('');
   const [experienceOpen, setExperienceOpen] = useState(false);
+  const [visitorId, setVisitorId] = useState('');
+  const [portfolioStats, setPortfolioStats] = useState(null);
+  const [statsMessage, setStatsMessage] = useState('');
+  const [actionMessage, setActionMessage] = useState('');
+  const [isLiking, setIsLiking] = useState(false);
+  const [isDownloadingResume, setIsDownloadingResume] = useState(false);
   const experienceDisclosureRef = useRef(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const loadStats = async () => {
+      try {
+        const id = getVisitorId();
+        const stats = await fetchPortfolioStats(id);
+
+        if (isMounted) {
+          setVisitorId(id);
+          setPortfolioStats(stats);
+        }
+      } catch (error) {
+        console.error('Could not load portfolio engagement stats.', error);
+        if (isMounted) {
+          setStatsMessage('Counts sync after Netlify deployment.');
+        }
+      }
+    };
+
+    loadStats();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     const name = 'Subin Ratna Tuladhar';
@@ -382,6 +441,116 @@ function App() {
     setMenuOpen(false);
   };
 
+  const handleLike = async () => {
+    if (isLiking) return;
+    if (!visitorId || !portfolioStats) {
+      setActionMessage('Likes sync when this portfolio is deployed on Netlify.');
+      return;
+    }
+
+    setIsLiking(true);
+    setActionMessage('');
+
+    try {
+      const response = await fetch(STATS_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: portfolioStats.liked ? 'unlike' : 'like',
+          visitorId,
+        }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not update the like.');
+      }
+
+      setPortfolioStats(data);
+    } catch (error) {
+      console.error('Could not update portfolio like.', error);
+      setActionMessage('Your like could not be saved. Please try again.');
+    } finally {
+      setIsLiking(false);
+    }
+  };
+
+  const handleResumeDownload = async () => {
+    if (isDownloadingResume) return;
+    if (!portfolioStats?.resumeAvailable) {
+      setActionMessage(
+        portfolioStats
+          ? `Add ${RESUME_FILENAME} to enable resume downloads.`
+          : 'Resume downloads are available after Netlify deployment.'
+      );
+      return;
+    }
+
+    setIsDownloadingResume(true);
+    setActionMessage('');
+
+    try {
+      const response = await fetch(RESUME_ENDPOINT);
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || 'The resume could not be downloaded.');
+      }
+
+      const resumeBlob = await response.blob();
+      const resumeUrl = URL.createObjectURL(resumeBlob);
+      const downloadLink = document.createElement('a');
+      downloadLink.href = resumeUrl;
+      downloadLink.download = RESUME_FILENAME;
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      downloadLink.remove();
+      window.setTimeout(() => URL.revokeObjectURL(resumeUrl), 1000);
+
+      if (response.headers.get('x-download-counted') === 'false') {
+        setActionMessage('The resume downloaded, but its download count could not be updated.');
+      } else {
+        const stats = await fetchPortfolioStats(visitorId);
+        setPortfolioStats(stats);
+      }
+    } catch (error) {
+      console.error('Could not download resume.', error);
+      setActionMessage('The resume could not be downloaded. Please try again later.');
+    } finally {
+      setIsDownloadingResume(false);
+    }
+  };
+
+  const handleShare = async () => {
+    setActionMessage('');
+    const shareData = {
+      title: document.title,
+      text: 'Take a look at my portfolio.',
+      url: window.location.href,
+    };
+
+    try {
+      if (navigator.share) {
+        await navigator.share(shareData);
+        setActionMessage('Thanks for sharing my portfolio.');
+        return;
+      }
+
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(shareData.url);
+        setActionMessage('Portfolio link copied to your clipboard.');
+        return;
+      }
+
+      window.prompt('Copy this portfolio link:', shareData.url);
+      setActionMessage('Copy the link to share my portfolio.');
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        console.error('Could not share portfolio.', error);
+        setActionMessage('The portfolio link could not be shared. Please copy the URL from your browser.');
+      }
+    }
+  };
+
   const toggleExperience = () => setExperienceOpen((isOpen) => !isOpen);
 
   return (
@@ -412,9 +581,21 @@ function App() {
             ))}
           </div>
 
-          <a className="nav-button" href="Subin_Ratna_Tuladhar.pdf" download>
+          <button
+            className="nav-button resume-button"
+            type="button"
+            onClick={handleResumeDownload}
+            disabled={isDownloadingResume}
+            title={portfolioStats?.resumeAvailable ? 'Download resume' : 'Resume PDF coming soon'}
+          >
             Resume
-          </a>
+            <span
+              className="resume-count"
+              aria-label={portfolioStats ? `${portfolioStats.downloads} resume downloads` : 'Loading resume download count'}
+            >
+              {portfolioStats?.downloads ?? '–'}
+            </span>
+          </button>
         </nav>
       </header>
 
@@ -443,10 +624,40 @@ function App() {
               <button className="button button--secondary" type="button" onClick={() => handleNavigate('contact')}>
                 Let&apos;s connect
               </button>
-              <a className="button button--secondary" href="Subin_Ratna_Tuladhar.pdf" download>
-                Resume download
-              </a>
+              <button
+                className="button button--secondary resume-button"
+                type="button"
+                onClick={handleResumeDownload}
+                disabled={isDownloadingResume}
+                title={portfolioStats?.resumeAvailable ? 'Download resume' : 'Resume PDF coming soon'}
+              >
+                {isDownloadingResume ? 'Preparing resume…' : 'Resume'}
+                <span
+                  className="resume-count"
+                  aria-label={portfolioStats ? `${portfolioStats.downloads} resume downloads` : 'Loading resume download count'}
+                >
+                  {portfolioStats?.downloads ?? '–'}
+                </span>
+              </button>
+              <button
+                className={`button button--secondary engagement-button ${portfolioStats?.liked ? 'is-liked' : ''}`}
+                type="button"
+                onClick={handleLike}
+                disabled={isLiking}
+                aria-pressed={Boolean(portfolioStats?.liked)}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.8-7.5 1.1-1.1a5.5 5.5 0 0 0-.1-7.8Z" />
+                </svg>
+                {portfolioStats?.liked ? 'Loved' : 'Love'} <span>{portfolioStats?.likes ?? '–'}</span>
+              </button>
+              <button className="button button--secondary" type="button" onClick={handleShare}>
+                Share
+              </button>
             </div>
+            <p className="engagement-message" role="status" aria-live="polite">
+              {actionMessage || statsMessage}
+            </p>
             <div className="hero__meta">
               <div>Glasgow, Scotland</div>
               <div>Open to meaningful design opportunities</div>

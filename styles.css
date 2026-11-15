@@ -149,6 +149,28 @@ body.scrolled .topbar {
   box-shadow: 0 18px 30px rgba(20, 20, 20, 0.14);
 }
 
+.resume-count {
+  display: inline-grid;
+  min-width: 1.55rem;
+  height: 1.55rem;
+  padding: 0 0.35rem;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(20, 20, 20, 0.13);
+  color: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.nav-button:disabled,
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+  box-shadow: none;
+}
+
 .nav-toggle {
   display: none;
 }
@@ -258,6 +280,45 @@ body.scrolled .topbar {
 .button--secondary {
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.045);
+  color: var(--ink);
+}
+
+.resume-button {
+  gap: 9px;
+  white-space: nowrap;
+}
+
+.engagement-button svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: fill 0.2s ease, color 0.2s ease;
+}
+
+.engagement-button.is-liked svg {
+  fill: #ff6b81;
+  stroke: #ff6b81;
+}
+
+.engagement-button span {
+  color: var(--muted);
+  font-size: 0.82em;
+}
+
+.engagement-message {
+  max-width: 540px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.74rem;
+  opacity: 0.72;
+}
+
+.engagement-message:empty {
+  display: none;
 }
 
 .hero__meta {
@@ -1799,7 +1860,7 @@ body.scrolled .topbar {
 
 @media (min-width: 769px) {
   #root {
-    padding-right: 156px;
+    padding-right: 180px;
   }
 
   .topbar,
@@ -1855,9 +1916,6 @@ body.scrolled .topbar {
     transform-origin: right;
   }
 
-  .nav-button {
-    justify-content: center;
-  }
 }
 
 @media (min-width: 769px) and (max-width: 1100px) {
@@ -1952,7 +2010,7 @@ body.scrolled .topbar {
     display: flex;
   }
 
-  .nav-button {
+  .resume-button.nav-button {
     display: none;
   }
 
