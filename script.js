@@ -229,6 +229,1056 @@ function ContactIcon({ name }) {
   );
 }
 
+function CallControls({ client, conversationId, userId, otherName }) {
+  const [call, setCall] = useState(null);
+  const [isReady, setIsReady] = useState(false);
+  const [callError, setCallError] = useState('');
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
+  const channelRef = useRef(null);
+  const callRef = useRef(null);
+  const peerRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const pendingCandidatesRef = useRef([]);
+  const timeoutRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const remoteAudioRef = useRef(null);
+
+  useEffect(() => {
+    let active = true;
+
+    const updateCall = (nextCall) => {
+      callRef.current = nextCall;
+      setCall(nextCall);
+    };
+
+    const cleanupCall = (updateState = true) => {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+      peerRef.current?.close();
+      peerRef.current = null;
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+      pendingCandidatesRef.current = [];
+      if (updateState) {
+        setLocalStream(null);
+        setRemoteStream(null);
+        updateCall(null);
+      }
+    };
+
+    const sendSignal = async (kind, callId, details = {}) => {
+      if (!channelRef.current) {
+        throw new Error('The call connection is not ready.');
+      }
+
+      const status = await channelRef.current.send({
+        type: 'broadcast',
+        event: 'signal',
+        payload: { kind, callId, senderId: userId, ...details },
+      });
+
+      if (status !== 'ok') {
+        throw new Error('Could not send the call request. Please try again.');
+      }
+    };
+
+    const createPeer = async (callId, mode) => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Calls need a supported browser and a secure HTTPS connection.');
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: mode === 'video',
+      });
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+
+      const peer = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+      peerRef.current = peer;
+      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+      peer.ontrack = (event) => {
+        const [incomingStream] = event.streams;
+        if (incomingStream) {
+          setRemoteStream(incomingStream);
+        }
+      };
+      peer.onicecandidate = (event) => {
+        if (event.candidate && callRef.current?.id === callId) {
+          sendSignal('ice-candidate', callId, { candidate: event.candidate.toJSON() })
+            .catch((error) => setCallError(error.message));
+        }
+      };
+      peer.onconnectionstatechange = () => {
+        if (peer.connectionState === 'connected' && callRef.current?.id === callId) {
+          updateCall({ ...callRef.current, status: 'connected' });
+        } else if (peer.connectionState === 'failed' && callRef.current?.id === callId) {
+          setCallError('The call could not connect. Try again on another network.');
+        }
+      };
+
+      return peer;
+    };
+
+    const armTimeout = (callId) => {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = window.setTimeout(() => {
+        if (callRef.current?.id !== callId) return;
+        sendSignal('no-answer', callId).catch((error) => setCallError(error.message));
+        cleanupCall();
+        setCallError('There was no answer. You can try calling again.');
+      }, 45000);
+    };
+
+    const handleSignal = async (payload) => {
+      if (!payload || payload.senderId === userId || typeof payload.callId !== 'string') return;
+
+      try {
+        if (payload.kind === 'invite') {
+          if (callRef.current) {
+            await sendSignal('busy', payload.callId);
+            return;
+          }
+
+          setCallError('');
+          updateCall({
+            id: payload.callId,
+            mode: payload.mode === 'video' ? 'video' : 'audio',
+            direction: 'incoming',
+            status: 'ringing',
+          });
+          armTimeout(payload.callId);
+          return;
+        }
+
+        if (payload.callId !== callRef.current?.id) return;
+
+        if (payload.kind === 'accepted' && callRef.current.direction === 'outgoing') {
+          window.clearTimeout(timeoutRef.current);
+          const peer = await createPeer(payload.callId, callRef.current.mode);
+          const offer = await peer.createOffer();
+          await peer.setLocalDescription(offer);
+          await sendSignal('offer', payload.callId, { description: peer.localDescription });
+          updateCall({ ...callRef.current, status: 'connecting' });
+        } else if (payload.kind === 'offer' && callRef.current.direction === 'incoming') {
+          const peer = peerRef.current;
+          if (!peer || !payload.description) return;
+          await peer.setRemoteDescription(new RTCSessionDescription(payload.description));
+          for (const candidate of pendingCandidatesRef.current) {
+            await peer.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          pendingCandidatesRef.current = [];
+          const answer = await peer.createAnswer();
+          await peer.setLocalDescription(answer);
+          await sendSignal('answer', payload.callId, { description: peer.localDescription });
+        } else if (payload.kind === 'answer' && callRef.current.direction === 'outgoing') {
+          const peer = peerRef.current;
+          if (!peer || !payload.description) return;
+          await peer.setRemoteDescription(new RTCSessionDescription(payload.description));
+          for (const candidate of pendingCandidatesRef.current) {
+            await peer.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          pendingCandidatesRef.current = [];
+        } else if (payload.kind === 'ice-candidate' && payload.candidate) {
+          if (peerRef.current?.remoteDescription) {
+            await peerRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate));
+          } else {
+            pendingCandidatesRef.current.push(payload.candidate);
+          }
+        } else if (payload.kind === 'declined') {
+          cleanupCall();
+          setCallError('The call was declined.');
+        } else if (payload.kind === 'busy') {
+          cleanupCall();
+          setCallError('The other person is already on a call.');
+        } else if (payload.kind === 'no-answer') {
+          cleanupCall();
+          setCallError('There was no answer. You can try calling again.');
+        } else if (payload.kind === 'hangup') {
+          cleanupCall();
+          setCallError('The call ended.');
+        }
+      } catch (error) {
+        const failedCallId = callRef.current?.id;
+        if (failedCallId) {
+          try {
+            await sendSignal('hangup', failedCallId);
+          } catch (signalError) {
+            console.error('Could not notify the other participant that the call ended.', signalError);
+          }
+        }
+        cleanupCall();
+        setCallError(error.message || 'The call could not be started.');
+      }
+    };
+
+    const channel = client
+      .channel(`portfolio-call:${conversationId}`, { config: { private: true } })
+      .on('broadcast', { event: 'signal' }, handleSignal);
+    channelRef.current = channel;
+    channel.subscribe((status) => {
+      if (!active) return;
+      if (status === 'SUBSCRIBED') {
+        setIsReady(true);
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        setCallError('Calls are temporarily unavailable in this conversation.');
+      }
+    });
+
+    return () => {
+      active = false;
+      cleanupCall(false);
+      setIsReady(false);
+      channelRef.current = null;
+      client.removeChannel(channel);
+    };
+  }, [client, conversationId, userId]);
+
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream;
+    }
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+    if (remoteAudioRef.current && remoteStream) {
+      remoteAudioRef.current.srcObject = remoteStream;
+    }
+  }, [localStream, remoteStream, call?.mode]);
+
+  const startCall = async (mode) => {
+    if (!isReady || callRef.current) return;
+
+    const nextCall = {
+      id: window.crypto.randomUUID(),
+      mode,
+      direction: 'outgoing',
+      status: 'ringing',
+    };
+    callRef.current = nextCall;
+    setCall(nextCall);
+    setCallError('');
+
+    try {
+      const status = await channelRef.current.send({
+        type: 'broadcast',
+        event: 'signal',
+        payload: { kind: 'invite', callId: nextCall.id, mode, senderId: userId },
+      });
+      if (status !== 'ok') throw new Error('Could not send the call request. Please try again.');
+      timeoutRef.current = window.setTimeout(() => {
+        if (callRef.current?.id !== nextCall.id) return;
+        channelRef.current.send({
+          type: 'broadcast',
+          event: 'signal',
+          payload: { kind: 'no-answer', callId: nextCall.id, senderId: userId },
+        }).catch((signalError) => {
+          console.error('Could not send the call timeout signal.', signalError);
+        });
+        callRef.current = null;
+        setCall(null);
+        setCallError('There was no answer. You can try calling again.');
+      }, 45000);
+    } catch (error) {
+      callRef.current = null;
+      setCall(null);
+      setCallError(error.message);
+    }
+  };
+
+  const respondToCall = async (accepted) => {
+    if (!call || call.direction !== 'incoming') return;
+
+    try {
+      window.clearTimeout(timeoutRef.current);
+      if (!accepted) {
+        const status = await channelRef.current.send({
+          type: 'broadcast',
+          event: 'signal',
+          payload: { kind: 'declined', callId: call.id, senderId: userId },
+        });
+        if (status !== 'ok') throw new Error('Could not decline the call. Please try again.');
+        callRef.current = null;
+        setCall(null);
+        return;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: call.mode === 'video',
+      });
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+      const peer = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+      peerRef.current = peer;
+      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+      peer.ontrack = (event) => {
+        const [incomingStream] = event.streams;
+        if (incomingStream) setRemoteStream(incomingStream);
+      };
+      peer.onicecandidate = (event) => {
+        if (event.candidate && callRef.current?.id === call.id) {
+          channelRef.current.send({
+            type: 'broadcast',
+            event: 'signal',
+            payload: { kind: 'ice-candidate', callId: call.id, senderId: userId, candidate: event.candidate.toJSON() },
+          }).catch((signalError) => setCallError(signalError.message || 'Call connection was interrupted.'));
+        }
+      };
+      peer.onconnectionstatechange = () => {
+        if (peer.connectionState === 'connected' && callRef.current?.id === call.id) {
+          callRef.current = { ...callRef.current, status: 'connected' };
+          setCall(callRef.current);
+        } else if (peer.connectionState === 'failed' && callRef.current?.id === call.id) {
+          setCallError('The call could not connect. Try again on another network.');
+        }
+      };
+      callRef.current = { ...call, status: 'connecting' };
+      setCall(callRef.current);
+      const status = await channelRef.current.send({
+        type: 'broadcast',
+        event: 'signal',
+        payload: { kind: 'accepted', callId: call.id, senderId: userId },
+      });
+      if (status !== 'ok') throw new Error('Could not accept the call. Please try again.');
+    } catch (error) {
+      try {
+        await channelRef.current?.send({
+          type: 'broadcast',
+          event: 'signal',
+          payload: { kind: 'hangup', callId: call.id, senderId: userId },
+        });
+      } catch (signalError) {
+        console.error('Could not notify the caller that call setup failed.', signalError);
+      }
+      callRef.current = null;
+      setCall(null);
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+      peerRef.current?.close();
+      peerRef.current = null;
+      setLocalStream(null);
+      setRemoteStream(null);
+      setCallError(error.message || 'The microphone or camera could not be started.');
+    }
+  };
+
+  const endCall = async () => {
+    if (call) {
+      try {
+        const status = await channelRef.current?.send({
+          type: 'broadcast',
+          event: 'signal',
+          payload: { kind: 'hangup', callId: call.id, senderId: userId },
+        });
+        if (status && status !== 'ok') {
+          throw new Error('The other person may not have received the call-ended signal.');
+        }
+      } catch (error) {
+        setCallError(error.message || 'The call ended, but the other person may not have received the update.');
+      }
+    }
+
+    window.clearTimeout(timeoutRef.current);
+    peerRef.current?.close();
+    peerRef.current = null;
+    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    localStreamRef.current = null;
+    pendingCandidatesRef.current = [];
+    callRef.current = null;
+    setLocalStream(null);
+    setRemoteStream(null);
+    setCall(null);
+  };
+
+  return (
+    <div className="chat-call-controls">
+      <div className="chat-call-actions">
+        <span>Keep this conversation open to call.</span>
+        <button type="button" onClick={() => startCall('audio')} disabled={!isReady || Boolean(call)}>
+          Voice call
+        </button>
+        <button type="button" onClick={() => startCall('video')} disabled={!isReady || Boolean(call)}>
+          Video call
+        </button>
+      </div>
+      {callError && <p className="chat-inline-error" role="status">{callError}</p>}
+      {call && (
+        <div className="chat-call-overlay" role="dialog" aria-modal="true" aria-label="Call controls">
+          <div className="chat-call-window">
+            <div className="chat-call-heading">
+              <div>
+                <strong>{call.direction === 'incoming' ? `Incoming ${call.mode} call` : `${call.mode === 'video' ? 'Video' : 'Voice'} call`}</strong>
+                <span>{call.direction === 'incoming' ? `From ${otherName}` : call.status === 'connected' ? 'Connected' : `Calling ${otherName}...`}</span>
+              </div>
+              {call.direction === 'incoming' && call.status === 'ringing' && (
+                <button type="button" className="chat-icon-button" aria-label="Decline call" onClick={() => respondToCall(false)}>
+                  ×
+                </button>
+              )}
+            </div>
+            {call.mode === 'video' && call.status !== 'ringing' && (
+              <div className="chat-video-grid">
+                <video ref={remoteVideoRef} autoPlay playsInline aria-label="Other participant video" />
+                <video ref={localVideoRef} autoPlay playsInline muted aria-label="Your camera preview" />
+              </div>
+            )}
+            {call.mode === 'audio' && call.status !== 'ringing' && (
+              <audio ref={remoteAudioRef} autoPlay />
+            )}
+            {call.direction === 'incoming' && call.status === 'ringing' ? (
+              <div className="chat-call-actions chat-call-actions--prompt">
+                <button type="button" className="chat-button chat-button--accept" onClick={() => respondToCall(true)}>
+                  Accept call
+                </button>
+                <button type="button" className="chat-button chat-button--quiet" onClick={() => respondToCall(false)}>
+                  Decline
+                </button>
+              </div>
+            ) : (
+              <>
+                {callError && <p className="chat-inline-error" role="alert">{callError}</p>}
+                <button type="button" className="chat-button chat-button--end" onClick={endCall}>
+                  End call
+                </button>
+              </>
+            )}
+            <p className="chat-call-privacy">Your camera and microphone are requested only after you accept.</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatDock() {
+  const [isOpen, setIsOpen] = useState(false);
+  const [client, setClient] = useState(null);
+  const [config, setConfig] = useState(null);
+  const [user, setUser] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isConversationLoading, setIsConversationLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [ownerLoginOpen, setOwnerLoginOpen] = useState(false);
+  const [ownerConversations, setOwnerConversations] = useState([]);
+  const [isOwnerLoading, setIsOwnerLoading] = useState(false);
+  const [selectedConversation, setSelectedConversation] = useState(null);
+  const [conversation, setConversation] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState('');
+  const [visitorName, setVisitorName] = useState('');
+  const [visitorEmail, setVisitorEmail] = useState('');
+  const [requestMessage, setRequestMessage] = useState('');
+  const [ownerEmail, setOwnerEmail] = useState('');
+  const [ownerPassword, setOwnerPassword] = useState('');
+  const [isBusy, setIsBusy] = useState(false);
+  const [filter, setFilter] = useState('pending');
+  const messageEndRef = useRef(null);
+  const activeConversation = user?.id === config?.ownerId ? selectedConversation : conversation;
+  const isOwner = Boolean(user && config && user.id === config.ownerId);
+  const pendingRequestCount = isOwner
+    ? ownerConversations.filter((item) => item.status === 'pending').length
+    : 0;
+
+  useEffect(() => {
+    let isMounted = true;
+    let authSubscription;
+
+    const initializeChat = async () => {
+      try {
+        const response = await fetch('/.netlify/functions/chat-config');
+        let settings;
+        try {
+          settings = await response.json();
+        } catch {
+          throw new Error('Chat setup could not be reached. Please use the deployed Netlify site.');
+        }
+        if (!response.ok) {
+          throw new Error(settings.error || 'Chat is not available yet.');
+        }
+        if (!window.supabase?.createClient) {
+          throw new Error('The chat service could not be loaded. Please refresh the page.');
+        }
+
+        const chatClient = window.supabase.createClient(settings.supabaseUrl, settings.supabaseAnonKey);
+        const authState = chatClient.auth.onAuthStateChange((_event, session) => {
+          if (isMounted) setUser(session?.user || null);
+        });
+        authSubscription = authState.data.subscription;
+
+        const { data, error: sessionError } = await chatClient.auth.getSession();
+        if (sessionError) throw sessionError;
+        if (isMounted) {
+          setClient(chatClient);
+          setConfig(settings);
+          setUser(data.session?.user || null);
+          setIsLoading(false);
+        }
+      } catch (loadError) {
+        console.error('Could not initialize portfolio chat.', loadError);
+        if (isMounted) {
+          setError(loadError.message || 'Chat is temporarily unavailable.');
+          setIsLoading(false);
+        }
+      }
+    };
+
+    initializeChat();
+    return () => {
+      isMounted = false;
+      authSubscription?.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!client || !user || isOwner) return undefined;
+    let isActive = true;
+    setIsConversationLoading(true);
+
+    const loadConversation = async () => {
+      const { data, error: loadError } = await client
+        .from('portfolio_chat_conversations')
+        .select('*')
+        .eq('visitor_id', user.id)
+        .in('status', ['pending', 'accepted'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!isActive) return;
+      if (loadError) {
+        setError('Your conversation could not be loaded. Please refresh and try again.');
+      } else {
+        setConversation(data || null);
+        setError('');
+      }
+      setIsConversationLoading(false);
+    };
+
+    loadConversation();
+    const channel = client
+      .channel(`portfolio-chat-visitor:${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'portfolio_chat_conversations', filter: `visitor_id=eq.${user.id}` },
+        (payload) => {
+          if (payload.new.status === 'declined') {
+            setConversation(null);
+          } else {
+            setConversation(payload.new);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      isActive = false;
+      client.removeChannel(channel);
+    };
+  }, [client, user?.id, isOwner]);
+
+  useEffect(() => {
+    if (!client || !isOwner || !user) return undefined;
+    let isActive = true;
+    setIsOwnerLoading(true);
+
+    const loadOwnerConversations = async () => {
+      const { data, error: loadError } = await client
+        .from('portfolio_chat_conversations')
+        .select('*')
+        .eq('owner_id', user.id)
+        .in('status', ['pending', 'accepted'])
+        .order('created_at', { ascending: false });
+
+      if (!isActive) return;
+      if (loadError) {
+        setError('Your inbox could not be loaded. Please try again.');
+      } else {
+        setOwnerConversations(data || []);
+        setError('');
+      }
+      setIsOwnerLoading(false);
+    };
+
+    loadOwnerConversations();
+    const channel = client
+      .channel(`portfolio-chat-owner:${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'portfolio_chat_conversations', filter: `owner_id=eq.${user.id}` },
+        loadOwnerConversations
+      )
+      .subscribe();
+
+    return () => {
+      isActive = false;
+      client.removeChannel(channel);
+    };
+  }, [client, user?.id, isOwner]);
+
+  useEffect(() => {
+    if (!selectedConversation) return;
+    const currentConversation = ownerConversations.find((item) => item.id === selectedConversation.id);
+    if (!currentConversation) {
+      setSelectedConversation(null);
+    } else if (currentConversation.status !== selectedConversation.status) {
+      setSelectedConversation(currentConversation);
+    }
+  }, [ownerConversations, selectedConversation?.id, selectedConversation?.status]);
+
+  useEffect(() => {
+    if (!client || !user || !activeConversation || activeConversation.status !== 'accepted') {
+      setMessages([]);
+      return undefined;
+    }
+
+    let isActive = true;
+    const conversationId = activeConversation.id;
+    setMessages([]);
+
+    const loadMessages = async () => {
+      const { data, error: loadError } = await client
+        .from('portfolio_chat_messages')
+        .select('*')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true });
+
+      if (!isActive) return;
+      if (loadError) {
+        setError('Messages could not be loaded. Please reopen the conversation.');
+      } else {
+        setMessages((currentMessages) => {
+          const messagesById = new Map((data || []).map((message) => [message.id, message]));
+          currentMessages.forEach((message) => messagesById.set(message.id, message));
+          return [...messagesById.values()].sort(
+            (left, right) => new Date(left.created_at) - new Date(right.created_at)
+          );
+        });
+      }
+    };
+
+    loadMessages();
+    const channel = client
+      .channel(`portfolio-chat-messages:${conversationId}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'portfolio_chat_messages', filter: `conversation_id=eq.${conversationId}` },
+        (payload) => {
+          setMessages((currentMessages) => (
+            currentMessages.some((message) => message.id === payload.new.id)
+              ? currentMessages
+              : [...currentMessages, payload.new]
+          ));
+        }
+      )
+      .subscribe();
+
+    return () => {
+      isActive = false;
+      client.removeChannel(channel);
+    };
+  }, [client, user?.id, activeConversation?.id, activeConversation?.status]);
+
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [messages, activeConversation?.request_message]);
+
+  const handleRequestSubmit = async (event) => {
+    event.preventDefault();
+    setError('');
+    setIsBusy(true);
+
+    try {
+      let visitor = user;
+      if (!visitor) {
+        const { data, error: signInError } = await client.auth.signInAnonymously();
+        if (signInError) throw signInError;
+        visitor = data.user;
+      }
+
+      if (!visitor?.id || visitor.id === config.ownerId) {
+        throw new Error('Please use a visitor browser session to send a request.');
+      }
+
+      const { data, error: insertError } = await client
+        .from('portfolio_chat_conversations')
+        .insert({
+          visitor_id: visitor.id,
+          owner_id: config.ownerId,
+          visitor_name: visitorName.trim(),
+          visitor_email: visitorEmail.trim(),
+          request_message: requestMessage.trim(),
+        })
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
+      setConversation(data);
+      setVisitorName('');
+      setVisitorEmail('');
+      setRequestMessage('');
+    } catch (submitError) {
+      console.error('Could not send chat request.', submitError);
+      setError(
+        submitError.code === '23505'
+          ? 'You already have an open request or conversation in this browser.'
+          : submitError.message || 'Your request could not be sent. Please try again.'
+      );
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleOwnerLogin = async (event) => {
+    event.preventDefault();
+    setError('');
+    setIsBusy(true);
+
+    try {
+      const { data, error: signInError } = await client.auth.signInWithPassword({
+        email: ownerEmail.trim(),
+        password: ownerPassword,
+      });
+      if (signInError) throw signInError;
+      if (data.user?.id !== config.ownerId) {
+        await client.auth.signOut();
+        throw new Error('This account is not authorized to access the portfolio inbox.');
+      }
+      setOwnerPassword('');
+      setOwnerLoginOpen(false);
+    } catch (loginError) {
+      console.error('Could not sign in to portfolio chat owner view.', loginError);
+      setError(loginError.message || 'Sign-in failed. Check your email and password.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const updateConversationStatus = async (nextStatus) => {
+    if (!selectedConversation) return;
+    setError('');
+    setIsBusy(true);
+
+    try {
+      const { data, error: updateError } = await client
+        .from('portfolio_chat_conversations')
+        .update({ status: nextStatus })
+        .eq('id', selectedConversation.id)
+        .select()
+        .single();
+      if (updateError) throw updateError;
+      setSelectedConversation(data);
+      setOwnerConversations((current) => current.map((item) => (item.id === data.id ? data : item)));
+      if (nextStatus === 'declined') setSelectedConversation(null);
+    } catch (updateError) {
+      console.error('Could not update chat request.', updateError);
+      setError('The request could not be updated. Please try again.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const sendMessage = async (event) => {
+    event.preventDefault();
+    const body = draft.trim();
+    if (!body || !activeConversation || !user) return;
+    setError('');
+    setIsBusy(true);
+
+    try {
+      const { data, error: sendError } = await client
+        .from('portfolio_chat_messages')
+        .insert({
+          conversation_id: activeConversation.id,
+          sender_id: user.id,
+          body,
+        })
+        .select()
+        .single();
+      if (sendError) throw sendError;
+      setMessages((current) => (
+        current.some((message) => message.id === data.id) ? current : [...current, data]
+      ));
+      setDraft('');
+    } catch (sendError) {
+      console.error('Could not send chat message.', sendError);
+      setError('Your message could not be sent. Please try again.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const signOutOwner = async () => {
+    setError('');
+    const { error: signOutError } = await client.auth.signOut();
+    if (signOutError) {
+      setError('You could not be signed out. Please try again.');
+      return;
+    }
+    setSelectedConversation(null);
+    setOwnerConversations([]);
+  };
+
+  const renderMessages = () => {
+    const initialRequest = activeConversation?.request_message
+      ? [{
+        id: `request-${activeConversation.id}`,
+        sender_id: activeConversation.visitor_id,
+        body: activeConversation.request_message,
+        created_at: activeConversation.created_at,
+      }]
+      : [];
+    const allMessages = [...initialRequest, ...messages];
+
+    return (
+      <div className="chat-messages" aria-live="polite">
+        {allMessages.length === 0 && (
+          <p className="chat-empty-messages">You’re connected. Send a message to get started.</p>
+        )}
+        {allMessages.map((message) => {
+          const isMine = message.sender_id === user?.id;
+          return (
+            <div key={message.id} className={`chat-message ${isMine ? 'chat-message--mine' : ''}`}>
+              <p>{message.body}</p>
+              <time dateTime={message.created_at}>
+                {new Date(message.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+              </time>
+            </div>
+          );
+        })}
+        <div ref={messageEndRef} />
+      </div>
+    );
+  };
+
+  const renderThread = (active, otherName) => (
+    <>
+      {isOwner && (
+        <div className="chat-thread-topline">
+          <button type="button" className="chat-back-button" onClick={() => setSelectedConversation(null)}>
+            ‹ Inbox
+          </button>
+          <span>{active.visitor_email}</span>
+        </div>
+      )}
+      <div className="chat-thread-status">
+        <span className="chat-online-dot" />
+        {isOwner ? `Connected with ${active.visitor_name}` : `Connected with ${otherName}`}
+      </div>
+      {renderMessages()}
+      <form className="chat-compose" onSubmit={sendMessage}>
+        <label className="sr-only" htmlFor="chat-message-input">Write a message</label>
+        <textarea
+          id="chat-message-input"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault();
+              event.currentTarget.form.requestSubmit();
+            }
+          }}
+          maxLength={2000}
+          placeholder="Write a message..."
+          rows="2"
+          disabled={isBusy}
+        />
+        <button type="submit" className="chat-send-button" disabled={isBusy || !draft.trim()}>
+          Send
+        </button>
+      </form>
+      <CallControls
+        client={client}
+        conversationId={active.id}
+        userId={user.id}
+        otherName={otherName}
+      />
+    </>
+  );
+
+  return (
+    <div className="chat-dock">
+      {isOpen && (
+        <section className="chat-panel" aria-label="Direct message beta">
+          <header className="chat-header">
+            <div>
+              <span className="chat-eyebrow">PORTFOLIO CHAT · BETA</span>
+              <h2>{isOwner ? 'Your inbox' : 'Let’s talk'}</h2>
+            </div>
+            <div className="chat-header-actions">
+              {client && !isOwner && !ownerLoginOpen && (
+                <button type="button" className="chat-owner-link" onClick={() => setOwnerLoginOpen(true)}>
+                  Owner sign in
+                </button>
+              )}
+              <button type="button" className="chat-icon-button" aria-label="Close chat" onClick={() => setIsOpen(false)}>
+                ×
+              </button>
+            </div>
+          </header>
+
+          {error && client && <p className="chat-error" role="alert">{error}</p>}
+
+          <div className="chat-content">
+            {isLoading ? (
+              <p className="chat-loading">Connecting to chat...</p>
+            ) : !client ? (
+              <div className="chat-unavailable">
+                <h3>Chat is not connected yet</h3>
+                <p>{error || 'The messaging beta has not been configured.'}</p>
+                <p>You can still reach me at <a href="mailto:subinmain100@gmail.com">subinmain100@gmail.com</a>.</p>
+              </div>
+            ) : isOwner ? (
+              selectedConversation ? (
+                selectedConversation.status === 'pending' ? (
+                  <div className="chat-request-detail">
+                    <button type="button" className="chat-back-button" onClick={() => setSelectedConversation(null)}>
+                      ‹ Inbox
+                    </button>
+                    <div className="chat-request-person">
+                      <span className="chat-avatar">{selectedConversation.visitor_name.slice(0, 1).toUpperCase()}</span>
+                      <div>
+                        <h3>{selectedConversation.visitor_name}</h3>
+                        <p>{selectedConversation.visitor_email}</p>
+                      </div>
+                    </div>
+                    <span className="chat-request-label">MESSAGE REQUEST</span>
+                    <p className="chat-request-message">{selectedConversation.request_message}</p>
+                    <p className="chat-privacy-note">Accepting opens text chat and lets either of you request a call.</p>
+                    <div className="chat-request-actions">
+                      <button
+                        type="button"
+                        className="chat-button chat-button--accept"
+                        disabled={isBusy}
+                        onClick={() => updateConversationStatus('accepted')}
+                      >
+                        Accept request
+                      </button>
+                      <button
+                        type="button"
+                        className="chat-button chat-button--quiet"
+                        disabled={isBusy}
+                        onClick={() => updateConversationStatus('declined')}
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  renderThread(selectedConversation, selectedConversation.visitor_name)
+                )
+              ) : (
+                <div className="chat-inbox">
+                  <div className="chat-inbox-tabs" role="tablist" aria-label="Inbox filter">
+                    <button type="button" className={filter === 'pending' ? 'active' : ''} onClick={() => setFilter('pending')}>
+                      Requests
+                      <span>{ownerConversations.filter((item) => item.status === 'pending').length}</span>
+                    </button>
+                    <button type="button" className={filter === 'accepted' ? 'active' : ''} onClick={() => setFilter('accepted')}>
+                      Chats
+                      <span>{ownerConversations.filter((item) => item.status === 'accepted').length}</span>
+                    </button>
+                    <button type="button" className="chat-signout-button" onClick={signOutOwner}>Sign out</button>
+                  </div>
+                  {isOwnerLoading ? (
+                    <p className="chat-loading">Loading your inbox...</p>
+                  ) : ownerConversations.filter((item) => item.status === filter).length === 0 ? (
+                    <div className="chat-inbox-empty">
+                      <span aria-hidden="true">{filter === 'pending' ? '✳' : '↗'}</span>
+                      <p>{filter === 'pending' ? 'New message requests will appear here.' : 'Accepted conversations will appear here.'}</p>
+                    </div>
+                  ) : (
+                    <div className="chat-inbox-list">
+                      {ownerConversations
+                        .filter((item) => item.status === filter)
+                        .map((item) => (
+                          <button
+                            type="button"
+                            className="chat-inbox-item"
+                            key={item.id}
+                            onClick={() => setSelectedConversation(item)}
+                          >
+                            <span className="chat-avatar">{item.visitor_name.slice(0, 1).toUpperCase()}</span>
+                            <span className="chat-inbox-copy">
+                              <strong>{item.visitor_name}</strong>
+                              <span>{item.request_message}</span>
+                            </span>
+                            <time>{new Date(item.created_at).toLocaleDateString()}</time>
+                          </button>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              )
+            ) : ownerLoginOpen ? (
+              <form className="chat-form" onSubmit={handleOwnerLogin}>
+                <button type="button" className="chat-back-button" onClick={() => setOwnerLoginOpen(false)}>
+                  ‹ Back to visitor chat
+                </button>
+                <h3>Owner sign in</h3>
+                <p>Private inbox access for Subin.</p>
+                <label htmlFor="chat-owner-email">Email</label>
+                <input id="chat-owner-email" type="email" autoComplete="username" value={ownerEmail} onChange={(event) => setOwnerEmail(event.target.value)} required />
+                <label htmlFor="chat-owner-password">Password</label>
+                <input id="chat-owner-password" type="password" autoComplete="current-password" value={ownerPassword} onChange={(event) => setOwnerPassword(event.target.value)} required />
+                <button type="submit" className="chat-button chat-button--accept" disabled={isBusy}>
+                  {isBusy ? 'Signing in...' : 'Sign in'}
+                </button>
+              </form>
+            ) : isConversationLoading ? (
+              <p className="chat-loading">Loading your conversation...</p>
+            ) : conversation?.status === 'accepted' ? (
+              renderThread(conversation, 'Subin')
+            ) : conversation?.status === 'pending' ? (
+              <div className="chat-waiting">
+                <span className="chat-waiting-mark" aria-hidden="true">✓</span>
+                <h3>Request sent</h3>
+                <p>Your message is with Subin. Once accepted, you can chat and request a voice or video call.</p>
+                <p className="chat-privacy-note">Keep this browser open to see the response. Your guest email is not verified.</p>
+              </div>
+            ) : (
+              <form className="chat-form" onSubmit={handleRequestSubmit}>
+                <p className="chat-intro">Send a message request. I’ll review it before the conversation opens.</p>
+                <label htmlFor="chat-visitor-name">Your name</label>
+                <input id="chat-visitor-name" value={visitorName} onChange={(event) => setVisitorName(event.target.value)} maxLength={80} autoComplete="name" required />
+                <label htmlFor="chat-visitor-email">Email</label>
+                <input id="chat-visitor-email" type="email" value={visitorEmail} onChange={(event) => setVisitorEmail(event.target.value)} maxLength={254} autoComplete="email" required />
+                <label htmlFor="chat-request-message">What would you like to discuss?</label>
+                <textarea id="chat-request-message" value={requestMessage} onChange={(event) => setRequestMessage(event.target.value)} maxLength={2000} rows="4" required />
+                <p className="chat-privacy-note">Your name and email are shared with Subin to handle this request. Email is not verified in this beta; messages are not end-to-end encrypted.</p>
+                <button type="submit" className="chat-button chat-button--accept" disabled={isBusy || !visitorName.trim() || !visitorEmail.trim() || !requestMessage.trim()}>
+                  {isBusy ? 'Sending request...' : 'Send message request'}
+                </button>
+              </form>
+            )}
+          </div>
+        </section>
+      )}
+      <button
+        type="button"
+        className={`chat-launcher ${isOpen ? 'chat-launcher--open' : ''}`}
+        aria-expanded={isOpen}
+        aria-label={isOpen ? 'Close direct message chat' : 'Open direct message chat'}
+        onClick={() => setIsOpen((open) => !open)}
+      >
+        <span aria-hidden="true">{isOpen ? '×' : '✳'}</span>
+        <span>{isOpen ? 'Close' : isOwner ? 'Inbox' : 'Message me'}</span>
+        {pendingRequestCount > 0 && (
+          <span className="chat-launcher-badge" aria-label={`${pendingRequestCount} pending requests`}>
+            {pendingRequestCount}
+          </span>
+        )}
+      </button>
+    </div>
+  );
+}
+
 const education = [
   {
     degree: 'Master of Science in Information Technology',
@@ -1078,6 +2128,8 @@ function App() {
       <button type="button" className="scroll-top" aria-label="Back to top" onClick={() => handleNavigate('home')}>
         ↑
       </button>
+
+      <ChatDock />
     </>
   );
 }
