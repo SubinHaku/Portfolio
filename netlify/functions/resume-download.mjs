@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getStore } from "@netlify/blobs";
 
-const resumeFilename = "Subin_Ratna_Tuladhar.pdf";
+const resumeFilename = "Subin_Ratna_Tuladhar_Professional_CV.pdf";
 
 function errorResponse(message, status) {
   return Response.json(

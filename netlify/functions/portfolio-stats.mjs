@@ -1,6 +1,6 @@
 import { getStore } from "@netlify/blobs";
 
-const resumeFilename = "Subin_Ratna_Tuladhar.pdf";
+const resumeFilename = "Subin_Ratna_Tuladhar_Professional_CV.pdf";
 const visitorIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function jsonResponse(data, status = 200) {

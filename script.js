@@ -1,6 +1,6 @@
 const { useEffect, useLayoutEffect, useRef, useState } = React;
 
-const RESUME_FILENAME = 'Subin_Ratna_Tuladhar.pdf';
+const RESUME_FILENAME = 'Subin_Ratna_Tuladhar_Professional_CV.pdf';
 const STATS_ENDPOINT = '/.netlify/functions/portfolio-stats';
 const RESUME_ENDPOINT = '/.netlify/functions/resume-download';
 
@@ -477,12 +477,19 @@ function App() {
 
   const handleResumeDownload = async () => {
     if (isDownloadingResume) return;
-    if (!portfolioStats?.resumeAvailable) {
-      setActionMessage(
-        portfolioStats
-          ? `Add ${RESUME_FILENAME} to enable resume downloads.`
-          : 'Resume downloads are available after Netlify deployment.'
-      );
+    if (!portfolioStats) {
+      const downloadLink = document.createElement('a');
+      downloadLink.href = RESUME_FILENAME;
+      downloadLink.download = RESUME_FILENAME;
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      downloadLink.remove();
+      setActionMessage('Downloading the CV without global count tracking.');
+      return;
+    }
+
+    if (!portfolioStats.resumeAvailable) {
+      setActionMessage(`Add ${RESUME_FILENAME} to enable resume downloads.`);
       return;
     }
 
